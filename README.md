@@ -17,4 +17,5 @@ $ sopel
 $ ln -s ~/devel/sopel-tts/tts.py ~/.sopel/modules/tts.py
 # edit ~/.sopel/default.cfg and set the `[tts]` config options, see example.cfg
 $ sopel
+# you should hear "All systems nominal, ready for messages." if everything worked correctly
 ~~~~
