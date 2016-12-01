@@ -129,6 +129,11 @@ def clean_message(msg):
 def clean_token(t):
     url = urlparse.urlparse(t)
     if url.scheme.startswith('http'):
-        return url.netloc
+        url = url.netloc.split('.')
+        if url[0] == 'www' and len(url) > 2:
+            url = '.'.join(url[1:])
+        else:
+            url = '.'.join(url)
+        return 'link to {}'.format(url)
     t = re.sub(r'((.)\2{2,})', r'\2', t)
     return t
