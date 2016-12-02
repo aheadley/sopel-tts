@@ -38,7 +38,10 @@ class TTSSection(StaticSection):
     play_cmd        = ValidatedAttribute('play_cmd',
         lambda pc: ('{}' in str(pc) and str(pc)))
 
-    mute            = ListAttribute('mute')
+    # never speak messages from these nicks
+    mute_nicks      = ListAttribute('mute_nicks', default=['ChanServ', 'NickServ'])
+    # never speak messages starting with these strings (think bot commands)
+    mute_msgs       = ListAttribute('mute_msgs', default=['.', '!'])
 
 def setup(bot):
     bot.config.define_section('tts', TTSSection)
@@ -50,7 +53,7 @@ def setup(bot):
         for v in polly_client.describe_voices()['Voices'] \
         if v['LanguageCode'].startswith(bot.config.tts.lang_family + u'-')],
         key=lambda v: v['Id'])
-    log.debug('Pulled %d voices: %s', len(voices), u', '.join(v['Id'] for v in voices))
+    log.debug(u'Pulled %d voices: %s', len(voices), u', '.join(v['Id'] for v in voices))
 
     if not bot.memory.contains('tts'):
         bot.memory['tts'] = sopel.tools.SopelMemory()
@@ -59,7 +62,7 @@ def setup(bot):
     bot.memory['tts']['voices'] = voices
     bot.memory['tts']['speech_queue'] = multiprocessing.Queue()
     bot.memory['tts']['speech_proc'] = multiprocessing.Process(target=worker_proc,
-        args=(bot.memory['tts']['speech_queue'], log, polly_client, bot.config.tts))
+        args=(bot.memory['tts']['speech_queue'], sopel.logger.get_logger('tts.worker'), polly_client, bot.config.tts))
 
     bot.memory['tts']['speech_proc'].start()
     bot.memory['tts']['speech_queue'].put((
@@ -67,19 +70,22 @@ def setup(bot):
 
 @sopel.module.rule(r'.*')
 def speak(bot, trigger):
-    if trigger.nick != bot.nick and str(trigger.nick) not in bot.config.tts.mute:
-        log.info('Speaking for: %s', trigger.nick)
-
+    if trigger.nick != bot.nick and str(trigger.nick) not in bot.config.tts.mute_nicks:
         msg = clean_message(trigger.group(0))
-        bot.memory['tts']['speech_queue'].put((
-            msg, nick2bucket(trigger.nick, bot.memory['tts']['voices'])))
-        log.debug('Queued message: %s', msg)
+        if msg and not any(msg.startswith(c) for c in bot.config.tts.mute_msgs):
+            bot.memory['tts']['speech_queue'].put((
+                msg, nick2bucket(trigger.nick, bot.memory['tts']['voices'])))
+            log.debug(u'Queued message: %s', msg)
+        else:
+            log.info(u'Skipping garbage message: %s', trigger.group(0))
+    else:
+        log.info(u'Ignoring muted nick: %s', trigger.nick)
 speak.priority = 'medium'
 
 @sopel.module.commands('myvoice')
 def show_my_voice(bot, trigger):
     v = nick2bucket(trigger.nick, bot.memory['tts']['voices'])
-    bot.say('Your voice is: {name} ({lang_name} - {gender}) [{lang_code}]'.format(
+    bot.say(u'Your voice is: {name} ({lang_name} - {gender}) [{lang_code}]'.format(
         name=v['Id'],
         lang_name=v['LanguageName'],
         gender=v['Gender'],
@@ -88,13 +94,15 @@ def show_my_voice(bot, trigger):
 show_my_voice.priority = 'medium'
 
 def worker_proc(queue, log, polly_client, tts_config):
+    # log = sopel.logger.get_logger('tts.worker')
+    log.setLevel(logging.DEBUG)
     log.debug('Speech process starting...')
     keep_running = True
     with open('/dev/null', 'rw') as dev_null:
         while keep_running:
             msg, voice = queue.get()
 
-            log.info('Synthesizing with "%s" [%s@%s]: %s',
+            log.info(u'Synthesizing with "%s" [%s@%s]: %s',
                 voice['Id'], tts_config.audio_format, tts_config.sample_rate, msg)
             resp = polly_client.synthesize_speech(
                 Text=msg,
@@ -108,7 +116,7 @@ def worker_proc(queue, log, polly_client, tts_config):
                 prefix='sopel-tts-',
             )
             os.close(tmp_f)
-            log.info('Writing audio to: %s', tmp_fn)
+            log.debug('Writing audio to: %s', tmp_fn)
             with open(tmp_fn, 'w') as tmp_f:
                 try:
                     tmp_f.write(resp['AudioStream'].read())
@@ -116,24 +124,34 @@ def worker_proc(queue, log, polly_client, tts_config):
                     log.error('Failed to speak: %s', err)
                     log.exception(err)
                     return
-            log.info('Playing queued audio from: %s', tmp_fn)
+            log.debug('Playing queued audio from: %s', tmp_fn)
             subprocess.call(tts_config.play_cmd.format(tmp_fn).split(), stdout=dev_null, stderr=dev_null)
             os.unlink(tmp_fn)
 
 def nick2bucket(nick, buckets):
-    return buckets[sum(bytearray(hashlib.md5(nick.strip().lower()).digest())) % len(buckets)]
+    return buckets[int(nick.strip().lower().encode('hex'), 16) % len(buckets)]
 
 def clean_message(msg):
-    return ' '.join(clean_token(t) for t in msg.split())
+    return u' '.join(clean_token(t) for t in msg.split()).strip()
 
 def clean_token(t):
     url = urlparse.urlparse(t)
     if url.scheme.startswith('http'):
-        url = url.netloc.split('.')
-        if url[0] == 'www' and len(url) > 2:
-            url = '.'.join(url[1:])
-        else:
-            url = '.'.join(url)
-        return 'link to {}'.format(url)
-    t = re.sub(r'((.)\2{2,})', r'\2', t)
-    return t
+        try:
+            domain_parts = url.netloc.split('.')
+            # if first part of the domain is 1-3 homogeneous characters, drop it
+            # catches things like (i.)imgur.com or (www.)example.com while skipping
+            # something like bbc.uk
+            if 3 >= len(domain_parts[0]) and 1 == len(set(domain_parts[0])):
+                t = u'.'.join(domain_parts[1:])
+            else:
+                t = url.netloc
+            return u'{{ {} }}'.format(t)
+        except Exception:
+            return u''
+    # reduce characters repeated 4+ times in a row to 2 characters
+    t = re.sub(r'((.)\2)(\2{2,})', r'\1', t)
+    if not t.encode('ascii', 'ignore').strip():
+        # filter out unicode garbage, unfortunately this sucks for other languages
+        t = u''
+    return t.strip()
