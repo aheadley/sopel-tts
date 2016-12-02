@@ -7,10 +7,12 @@ import hashlib
 import tempfile
 import subprocess
 import os
+import os.path
 import logging
 import urlparse
 import re
 import multiprocessing
+import glob
 
 import sopel.module
 import sopel.tools
@@ -94,11 +96,17 @@ def show_my_voice(bot, trigger):
 show_my_voice.priority = 'medium'
 
 def worker_proc(queue, log, polly_client, tts_config):
+    log.debug('Speech worker process starting...')
     # log = sopel.logger.get_logger('tts.worker')
     log.setLevel(logging.DEBUG)
-    log.debug('Speech process starting...')
+
+    for old_fn in glob.glob(os.path.join(tempfile.gettempdir(), 'sopel-tts-*.*')):
+        log.info('Deleteing old temp file: %s', old_fn)
+        os.unlink(old_fn)
+
     keep_running = True
     with open('/dev/null', 'rw') as dev_null:
+        log.info('Ready to accept messages!')
         while keep_running:
             msg, voice = queue.get()
 
@@ -127,6 +135,7 @@ def worker_proc(queue, log, polly_client, tts_config):
             log.debug('Playing queued audio from: %s', tmp_fn)
             subprocess.call(tts_config.play_cmd.format(tmp_fn).split(), stdout=dev_null, stderr=dev_null)
             os.unlink(tmp_fn)
+    log.debug('Speech worker process exiting!')
 
 def nick2bucket(nick, buckets):
     return buckets[int(nick.strip().lower().encode('hex'), 16) % len(buckets)]
