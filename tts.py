@@ -64,8 +64,9 @@ def setup(bot):
     bot.memory['tts']['voices'] = voices
     bot.memory['tts']['speech_queue'] = multiprocessing.Queue()
     bot.memory['tts']['speech_proc'] = multiprocessing.Process(target=worker_proc,
-        args=(bot.memory['tts']['speech_queue'], sopel.logger.get_logger('tts.worker'), polly_client, bot.config.tts))
+        args=(bot.memory['tts']['speech_queue'], polly_client, bot.config.tts))
 
+    log.debug('Setup finished, starting audio worker and queueing debug message')
     bot.memory['tts']['speech_proc'].start()
     bot.memory['tts']['speech_queue'].put((
         'All systems nominal, ready for messages.', nick2bucket(bot.nick, voices)))
@@ -77,9 +78,9 @@ def speak(bot, trigger):
         if msg and not any(msg.startswith(c) for c in bot.config.tts.mute_msgs):
             bot.memory['tts']['speech_queue'].put((
                 msg, nick2bucket(trigger.nick, bot.memory['tts']['voices'])))
-            log.debug(u'Queued message: %s', msg)
+            log.debug(u'Queued message: "%s"', msg)
         else:
-            log.info(u'Skipping garbage message: %s', trigger.group(0))
+            log.warning(u'Skipping garbage message: "%s"', trigger.group(0))
     else:
         log.info(u'Ignoring muted nick: %s', trigger.nick)
 speak.priority = 'medium'
@@ -95,10 +96,12 @@ def show_my_voice(bot, trigger):
     ))
 show_my_voice.priority = 'medium'
 
-def worker_proc(queue, log, polly_client, tts_config):
-    log.debug('Speech worker process starting...')
-    # log = sopel.logger.get_logger('tts.worker')
+def worker_proc(queue, polly_client, tts_config):
+    logging.basicConfig()
+    log = logging.getLogger('sopel.modules.tts.worker')
     log.setLevel(logging.DEBUG)
+
+    log.debug('Speech worker process starting...')
 
     for old_fn in glob.glob(os.path.join(tempfile.gettempdir(), 'sopel-tts-*.*')):
         log.info('Deleteing old temp file: %s', old_fn)
@@ -110,7 +113,7 @@ def worker_proc(queue, log, polly_client, tts_config):
         while keep_running:
             msg, voice = queue.get()
 
-            log.info(u'Synthesizing with "%s" [%s@%s]: %s',
+            log.info(u'Synthesizing with "%s" [%s@%s]: "%s"',
                 voice['Id'], tts_config.audio_format, tts_config.sample_rate, msg)
             resp = polly_client.synthesize_speech(
                 Text=msg,
@@ -131,7 +134,7 @@ def worker_proc(queue, log, polly_client, tts_config):
                 except Exception as err:
                     log.error('Failed to speak: %s', err)
                     log.exception(err)
-                    return
+                    continue
             log.debug('Playing queued audio from: %s', tmp_fn)
             subprocess.call(tts_config.play_cmd.format(tmp_fn).split(), stdout=dev_null, stderr=dev_null)
             os.unlink(tmp_fn)
