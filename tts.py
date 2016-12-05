@@ -98,7 +98,7 @@ show_my_voice.priority = 'medium'
 
 def worker_proc(queue, polly_client, tts_config):
     logging.basicConfig()
-    log = logging.getLogger('sopel.modules.tts.worker')
+    log = logging.getLogger('sopel.modules.tts.worker-{:05d}'.format(os.getpid()))
     log.setLevel(logging.DEBUG)
 
     log.debug('Speech worker process starting...')
