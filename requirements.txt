@@ -6,6 +6,8 @@ decorator==4.0.10
 docutils==0.12
 futures==3.0.5
 jmespath==0.9.0
+langid==1.1.6
+numpy==1.11.2
 praw==4.0.0
 prawcore==0.3.0
 pyenchant==1.6.8
