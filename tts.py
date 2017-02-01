@@ -35,6 +35,7 @@ TOKEN_REPLACEMENT_MAP       = {
     r'lol':                      'ph:l o l',
     r'\<3':                      'heart',
 }
+STARTUP_MESSAGE             = u'All systems nominal, ready for messages.'
 
 log = sopel.logger.get_logger('tts')
 log.setLevel(logging.DEBUG)
@@ -46,6 +47,8 @@ class TTSSection(StaticSection):
 
     default_lang    = ValidatedAttribute('default_lang',
         lambda lf: len(lf) == 2 and str(lf), default='en')
+    force_lang      = ValidatedAttribute('force_lang',
+        lambda fl: fl.strip().lower() == 'true', default='false')
     audio_format    = ChoiceAttribute('audio_format', VALID_AUDIO_FORMATS, default='mp3')
     sample_rate     = ChoiceAttribute('sample_rate', VALID_SAMPLE_RATES, default='22050')
     speech_rate     = ValidatedAttribute('speech_rate', float, default=1.1)
@@ -57,12 +60,19 @@ class TTSSection(StaticSection):
     mute_nicks      = ListAttribute('mute_nicks', default=['ChanServ', 'NickServ'])
     # never speak messages starting with these strings (think bot commands)
     mute_msgs       = ListAttribute('mute_msgs', default=['.', '!'])
+    # never speak messages from these channels
+    mute_channels   = ListAttribute('mute_channels', default=[])
+
+    startup_msg     = ValidatedAttribute('startup_msg', str, default=STARTUP_MESSAGE)
 
 def setup(bot):
     bot.config.define_section('tts', TTSSection)
 
     if not bot.memory.contains('tts'):
         bot.memory['tts'] = sopel.tools.SopelMemory()
+
+    # also ignore PMs from muted nicks
+    bot.config.tts.mute_channels += bot.config.tts.mute_nicks
 
     bot.memory['tts']['msg_queue'] = multiprocessing.Queue()
     bot.memory['tts']['audio_queue'] = multiprocessing.Queue()
@@ -84,11 +94,12 @@ def speak(bot, trigger):
     original_msg = trigger.group(0).strip()
     if trigger.nick != bot.nick \
             and str(trigger.nick) not in bot.config.tts.mute_nicks \
-            and not any(original_msg.startswith(c) for c in bot.config.tts.mute_msgs):
+            and not any(original_msg.startswith(c) for c in bot.config.tts.mute_msgs) \
+            and not any(trigger.sender == c for c in bot.config.tts.mute_channels):
         bot.memory['tts']['msg_queue'].put((original_msg, trigger.nick))
         log.debug(u'Queued message: "%s"', original_msg)
     else:
-        log.info(u'Ignoring message from: %s', trigger.nick)
+        log.info(u'Ignoring message from: %s@%s', trigger.nick, trigger.sender)
 speak.priority = 'medium'
 
 def worker_proc(msg_queue, audio_queue, tts_config):
@@ -131,11 +142,15 @@ def worker_proc(msg_queue, audio_queue, tts_config):
             message=msg,
         )
 
-        msg_lang = langid.classify(orig_msg)[0]
-        log.debug(u'Detected message language as: %s', msg_lang)
-        if msg_lang not in voice_langs:
+        if tts_config.force_lang:
             msg_lang = tts_config.default_lang
-            log.warning(u'Detected language is not an available voice, defaulting to: %s', msg_lang)
+            log.debug(u'Forcing message language to: %s', msg_lang)
+        else:
+            msg_lang = langid.classify(orig_msg)[0]
+            log.debug(u'Detected message language as: %s', msg_lang)
+            if msg_lang not in voice_langs:
+                msg_lang = tts_config.default_lang
+                log.warning(u'Detected language is not an available voice, defaulting to: %s', msg_lang)
         msg_voices = [v for v in voices if v['LanguageCode'].startswith(msg_lang + '-')]
         voice = nick2bucket(nick, msg_voices)
 
