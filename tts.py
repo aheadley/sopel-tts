@@ -14,6 +14,7 @@ import re
 import multiprocessing
 import glob
 import time
+import functools
 from xml.sax.saxutils import escape as xml_escape
 
 import sopel.module
@@ -35,10 +36,23 @@ TOKEN_REPLACEMENT_MAP       = {
     r'lol':                      'ph:l o l',
     r'\<3':                      'heart',
 }
-STARTUP_MESSAGE             = u'All systems nominal, ready for messages.'
+# https://www.youtube.com/watch?v=QrWAdq8e_uA
+STARTUP_MESSAGE             = u'Reactor online. Sensors online. Weapons online. All systems nominal.'
 
 log = sopel.logger.get_logger('tts')
 log.setLevel(logging.DEBUG)
+
+def multiprocessify(func):
+    @functools.wraps(func)
+    def wrapper(*pargs, **kwargs):
+        return multiprocessing.Process(target=func, args=pargs, kwargs=kwargs)
+    return wrapper
+
+def getWorkerLogger(worker_name, level=logging.DEBUG):
+    logging.basicConfig()
+    log = logging.getLogger('sopel.modules.tts.{}-{:05d}'.format(worker_name, os.getpid()))
+    log.setLevel(level)
+    return log
 
 class TTSSection(StaticSection):
     access_key      = ValidatedAttribute('access_key', str)
@@ -74,20 +88,22 @@ def setup(bot):
     # also ignore PMs from muted nicks
     bot.config.tts.mute_channels += bot.config.tts.mute_nicks
 
-    bot.memory['tts']['msg_queue'] = multiprocessing.Queue()
-    bot.memory['tts']['audio_queue'] = multiprocessing.Queue()
+    bot.memory['tts']['queues'] = {
+        'text':         multiprocessing.Queue(),
+        'audio':        multiprocessing.Queue(),
+    }
+    bot.memory['tts']['workers'] = {
+        'processor':    handle_messages(bot.memory['tts']['queues']['text'],
+                            bot.memory['tts']['queues']['audio'], bot.config.tts),
+        'player':       play_audio(bot.memory['tts']['queues']['audio'],
+                            bot.config.tts.play_cmd),
+    }
 
-    bot.memory['tts']['worker_proc'] = multiprocessing.Process(target=worker_proc,
-        args=(bot.memory['tts']['msg_queue'], bot.memory['tts']['audio_queue'],
-            bot.config.tts))
-    bot.memory['tts']['player_proc'] = multiprocessing.Process(target=player_proc,
-        args=(bot.memory['tts']['audio_queue'], bot.config.tts.play_cmd))
+    log.debug('Setup finished, starting workers and sending debug message')
+    for worker in bot.memory['tts']['workers'].values():
+        worker.start()
 
-    log.debug('Setup finished, starting audio+player workers and queueing debug message')
-    bot.memory['tts']['worker_proc'].start()
-    bot.memory['tts']['player_proc'].start()
-
-    bot.memory['tts']['msg_queue'].put(('All systems nominal, ready for messages.', bot.nick))
+    bot.memory['tts']['queues']['text'].put((bot.config.tts.startup_msg, bot.nick))
 
 @sopel.module.rule(r'.*')
 def speak(bot, trigger):
@@ -96,23 +112,21 @@ def speak(bot, trigger):
             and str(trigger.nick) not in bot.config.tts.mute_nicks \
             and not any(original_msg.startswith(c) for c in bot.config.tts.mute_msgs) \
             and not any(trigger.sender == c for c in bot.config.tts.mute_channels):
-        bot.memory['tts']['msg_queue'].put((original_msg, trigger.nick))
-        log.debug(u'Queued message: "%s"', original_msg)
+        bot.memory['tts']['queues']['text'].put((original_msg, trigger.nick))
+        log.debug(u'Queued message from [%s@%s]: "%s"', trigger.nick, trigger.sender, original_msg)
     else:
         log.info(u'Ignoring message from: %s@%s', trigger.nick, trigger.sender)
 speak.priority = 'medium'
 
-def worker_proc(msg_queue, audio_queue, tts_config):
-    logging.basicConfig()
-    log = logging.getLogger('sopel.modules.tts.worker-{:05d}'.format(os.getpid()))
-    log.setLevel(logging.DEBUG)
-
+@multiprocessify
+def handle_messages(msg_queue, audio_queue, tts_config):
+    log = getWorkerLogger('processor')
     log.debug('Worker process starting')
 
     import langid
     # there's a large delay while langid loads the model on the first classify()
     # call, so we do that now
-    langid.classify('default text')
+    langid.classify(STARTUP_MESSAGE)
 
     for old_fn in glob.glob(os.path.join(tempfile.gettempdir(), 'sopel-tts-*.*')):
         log.info('Deleteing old temp file: %s', old_fn)
@@ -128,7 +142,7 @@ def worker_proc(msg_queue, audio_queue, tts_config):
     log.debug(u'Found %d voices from language families: %s',
         len(voices), u', '.join(voice_langs))
 
-    log.info('Ready to accept messages')
+    log.info('Ready to work')
     while True:
         orig_msg, nick = msg_queue.get()
 
@@ -174,30 +188,33 @@ def worker_proc(msg_queue, audio_queue, tts_config):
             try:
                 tmp_f.write(resp['AudioStream'].read())
             except Exception as err:
-                log.error('Failed to speak: %s', err)
+                log.error('Failed to write audio file (%s): %s', tmp_fn, err)
                 log.exception(err)
-                continue
-        audio_queue.put(tmp_fn)
-        log.debug('Queued file: %s', tmp_fn)
-
+            else:
+                audio_queue.put(tmp_fn)
+                log.debug('Queued audio file: %s', tmp_fn)
     log.debug('Worker process stopping')
 
-def player_proc(audio_queue, play_cmd):
-    logging.basicConfig()
-    log = logging.getLogger('sopel.modules.tts.player-{:05d}'.format(os.getpid()))
-    log.setLevel(logging.DEBUG)
-
-    log.debug('Player process starting')
+@multiprocessify
+def play_audio(audio_queue, play_cmd):
+    log = getWorkerLogger('player')
+    log.debug('Worker process starting')
 
     with open('/dev/null', 'rw') as dev_null:
-        log.info('Ready to accept audio files')
+        log.info('Ready to work')
         while True:
             fn = audio_queue.get()
-            log.debug('Playing queued audio from file: %s', fn)
-            subprocess.call(play_cmd.format(fn).split(), stdout=dev_null, stderr=dev_null)
-            os.unlink(fn)
-            time.sleep(0.3)
-    log.debug('Player process stopping')
+            log.debug('Playing audio file: %s', fn)
+            try:
+                subprocess.call(play_cmd.format(fn).split(), stdout=dev_null, stderr=dev_null)
+            except Exception as err:
+                log.error('Failed to play audio file (%s): %s', fn, err)
+                log.exception(err)
+            else:
+                os.unlink(fn)
+                log.debug('Deleted audio file: %s', fn)
+                time.sleep(0.3)
+    log.debug('Worker process stopping')
 
 
 def nick2bucket(nick, buckets):
