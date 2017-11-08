@@ -23,6 +23,7 @@ import sopel.logger
 from sopel.config.types import StaticSection, ValidatedAttribute, ChoiceAttribute, ListAttribute
 
 import boto3
+import langid
 
 VALID_AUDIO_FORMATS         = ['mp3', 'ogg_vorbis', 'pcm']
 VALID_SAMPLE_RATES          = ['8000', '16000', '22050']
@@ -63,6 +64,7 @@ class TTSSection(StaticSection):
         lambda lf: len(lf) == 2 and str(lf), default='en')
     force_lang      = ValidatedAttribute('force_lang',
         lambda fl: fl.strip().lower() == 'true', default='false')
+    confidence_threshold = ValidatedAttribute('confidence_threshold', float, default=0.4)
     audio_format    = ChoiceAttribute('audio_format', VALID_AUDIO_FORMATS, default='mp3')
     sample_rate     = ChoiceAttribute('sample_rate', VALID_SAMPLE_RATES, default='22050')
     speech_rate     = ValidatedAttribute('speech_rate', float, default=1.1)
@@ -88,6 +90,9 @@ def setup(bot):
     # also ignore PMs from muted nicks
     bot.config.tts.mute_channels += bot.config.tts.mute_nicks
 
+    bot.memory['tts']['control'] = {
+        'mute':         False,
+    }
     bot.memory['tts']['queues'] = {
         'text':         multiprocessing.Queue(),
         'audio':        multiprocessing.Queue(),
@@ -105,10 +110,23 @@ def setup(bot):
 
     bot.memory['tts']['queues']['text'].put((bot.config.tts.startup_msg, bot.nick))
 
+@sopel.module.commands('tts')
+@sopel.module.require_owner()
+def control(bot, trigger):
+    cmd = trigger.group(2).strip().lower()
+    if cmd == 'mute':
+        bot.memory['tts']['control']['mute'] = True
+        log.info(u'Muting tts speech, no new messages will be spoken')
+    if cmd == 'unmute':
+        bot.memory['tts']['control']['mute'] = False
+        log.info(u'Unmuting tts speech, messages will be spoken again')
+control.priority = 'medium'
+
 @sopel.module.rule(r'.*')
 def speak(bot, trigger):
     original_msg = trigger.group(0).strip()
     if trigger.nick != bot.nick \
+            and not bot.memory['tts']['control']['mute'] \
             and str(trigger.nick) not in bot.config.tts.mute_nicks \
             and not any(original_msg.startswith(c) for c in bot.config.tts.mute_msgs) \
             and not any(trigger.sender == c for c in bot.config.tts.mute_channels):
@@ -123,11 +141,6 @@ def handle_messages(msg_queue, audio_queue, tts_config):
     log = getWorkerLogger('processor')
     log.debug('Worker process starting')
 
-    import langid
-    # there's a large delay while langid loads the model on the first classify()
-    # call, so we do that now
-    langid.classify(STARTUP_MESSAGE)
-
     for old_fn in glob.glob(os.path.join(tempfile.gettempdir(), 'sopel-tts-*.*')):
         log.info('Deleteing old temp file: %s', old_fn)
         os.unlink(old_fn)
@@ -141,6 +154,13 @@ def handle_messages(msg_queue, audio_queue, tts_config):
     voice_langs = set(v['LanguageCode'].split('-')[0] for v in voices)
     log.debug(u'Found %d voices from language families: %s',
         len(voices), u', '.join(voice_langs))
+
+    lang_classifier = langid.langid.LanguageIdentifier.from_modelstring(
+        langid.langid.model, norm_probs=True)
+    lang_classifier.set_languages(voice_langs)
+    # there's a large delay while langid loads the model on the first classify()
+    # call, so we do that now
+    lang_classifier.classify(STARTUP_MESSAGE)
 
     log.info('Ready to work')
     while True:
@@ -160,8 +180,12 @@ def handle_messages(msg_queue, audio_queue, tts_config):
             msg_lang = tts_config.default_lang
             log.debug(u'Forcing message language to: %s', msg_lang)
         else:
-            msg_lang = langid.classify(orig_msg)[0]
-            log.debug(u'Detected message language as: %s', msg_lang)
+            msg_lang, prob = lang_classifier.classify(orig_msg)
+            log.debug(u'Detected message language as: %s (p%0.5f)', msg_lang, prob)
+            if prob < tts_config.confidence_threshold:
+                msg_lang = tts_config.default_lang
+                log.info(u'Detection confidence too low (<p%0.2f), defaulting to: %s',
+                    tts_config.confidence_threshold, msg_lang)
             if msg_lang not in voice_langs:
                 msg_lang = tts_config.default_lang
                 log.warning(u'Detected language is not an available voice, defaulting to: %s', msg_lang)
