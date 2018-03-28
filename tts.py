@@ -26,9 +26,7 @@ import boto3
 import langid
 import googleapiclient.discovery
 
-VALID_AUDIO_FORMATS         = ['mp3', 'ogg_vorbis', 'pcm']
-VALID_SAMPLE_RATES          = ['8000', '16000', '22050']
-VALID_VOICE_PITCHES         = ['low', 'medium', 'high']
+VALID_VOICE_PITCHES         = ['low', 'medium', 'medium', 'medium', 'high']
 MESSAGE_TEMPLATE            = u"""
 <speak><prosody rate="{rate}" pitch="{pitch}">{message}</prosody></speak>
 """.strip()
@@ -192,8 +190,8 @@ def handle_messages(msg_queue, audio_queue, tts_config):
             msg_voices = [v for v in voices if u'Wavenet' in v.name]
         voice = nick2bucket(nick, msg_voices)
 
-        log.info(u'Synthesizing with voice:"%s": "%s"',
-            voice.name, msg)
+        log.info(u'Synthesizing with voice [%s:%s]: "%s"',
+            voice.service, voice.name, msg)
 
         try:
             speech = voice.speak(msg)
@@ -323,9 +321,9 @@ class AmazonVoice(AbstractVoice):
         return self._client.synthesize_speech(
             Text=message,
             TextType='ssml',
-            VoiceId=voice['Id'],
+            VoiceId=self.name,
             OutputFormat='mp3',
-            SampleRate=22050,
+            SampleRate='22050',
         )['AudioStream'].read()
 
 class TTSHelper(object):
