@@ -24,6 +24,7 @@ from sopel.config.types import StaticSection, ValidatedAttribute, ChoiceAttribut
 
 import boto3
 import langid
+import googleapiclient.discovery
 
 VALID_AUDIO_FORMATS         = ['mp3', 'ogg_vorbis', 'pcm']
 VALID_SAMPLE_RATES          = ['8000', '16000', '22050']
@@ -36,6 +37,7 @@ EMPHASIS_TEMPLATE           = u'<emphasis level="{}">{}</emphasis>'
 TOKEN_REPLACEMENT_MAP       = {
     r'lol':                      'ph:l o l',
     r'\<3':                      'heart',
+    r'\\o/':                     'hurray',
 }
 # https://www.youtube.com/watch?v=QrWAdq8e_uA
 STARTUP_MESSAGE             = u'Reactor online. Sensors online. Weapons online. All systems nominal.'
@@ -55,19 +57,20 @@ def getWorkerLogger(worker_name, level=logging.DEBUG):
     log.setLevel(level)
     return log
 
+validate_bool = lambda v: v.strip().lower() == 'true'
 class TTSSection(StaticSection):
-    access_key      = ValidatedAttribute('access_key', str)
-    secret_key      = ValidatedAttribute('secret_key', str)
-    region          = ValidatedAttribute('region', str, default='us-east-1')
+    aws_access_key  = ValidatedAttribute('aws_access_key', str)
+    aws_secret_key  = ValidatedAttribute('aws_secret_key', str)
+    gcloud_api_key  = ValidatedAttribute('gcloud_api_key', str)
 
+    prefer_wavenet  = ValidatedAttribute('prefer_wavenet',
+        validate_bool, default='false')
     default_lang    = ValidatedAttribute('default_lang',
         lambda lf: len(lf) == 2 and str(lf), default='en')
     force_lang      = ValidatedAttribute('force_lang',
-        lambda fl: fl.strip().lower() == 'true', default='false')
+        validate_bool, default='false')
     confidence_threshold = ValidatedAttribute('confidence_threshold', float, default=0.4)
-    audio_format    = ChoiceAttribute('audio_format', VALID_AUDIO_FORMATS, default='mp3')
-    sample_rate     = ChoiceAttribute('sample_rate', VALID_SAMPLE_RATES, default='22050')
-    speech_rate     = ValidatedAttribute('speech_rate', float, default=1.1)
+    speech_rate     = ValidatedAttribute('speech_rate', str, default='default')
 
     play_cmd        = ValidatedAttribute('play_cmd',
         lambda pc: ('{}' in str(pc) and str(pc)))
@@ -141,17 +144,11 @@ def handle_messages(msg_queue, audio_queue, tts_config):
     log = getWorkerLogger('processor')
     log.debug('Worker process starting')
 
-    for old_fn in glob.glob(os.path.join(tempfile.gettempdir(), 'sopel-tts-*.*')):
-        log.info('Deleteing old temp file: %s', old_fn)
-        os.unlink(old_fn)
+    helper = TTSHelper(log, tts_config)
+    helper.purge_tmp_files()
 
-    polly_client = boto3.client('polly',
-        aws_access_key_id=tts_config.access_key,
-        aws_secret_access_key=tts_config.secret_key,
-    )
-
-    voices = sorted(polly_client.describe_voices()['Voices'], key=lambda v: v['Id'])
-    voice_langs = set(v['LanguageCode'].split('-')[0] for v in voices)
+    voices = helper.get_all_voices()
+    voice_langs = set(v.lang_id.split('-')[0] for v in voices)
     log.debug(u'Found %d voices from language families: %s',
         len(voices), u', '.join(voice_langs))
 
@@ -189,34 +186,26 @@ def handle_messages(msg_queue, audio_queue, tts_config):
             if msg_lang not in voice_langs:
                 msg_lang = tts_config.default_lang
                 log.warning(u'Detected language is not an available voice, defaulting to: %s', msg_lang)
-        msg_voices = [v for v in voices if v['LanguageCode'].startswith(msg_lang + '-')]
+        msg_voices = [v for v in voices if v.lang_id.startswith(msg_lang + '-')]
+        if tts_config.prefer_wavenet and any(u'Wavenet' in v.name for v in voices):
+            # only use wavenet voices if available
+            msg_voices = [v for v in voices if u'Wavenet' in v.name]
         voice = nick2bucket(nick, msg_voices)
 
-        log.info(u'Synthesizing with "%s" [%s@%s]: "%s"',
-            voice['Id'], tts_config.audio_format, tts_config.sample_rate, msg)
-        resp = polly_client.synthesize_speech(
-            Text=msg,
-            TextType='ssml',
-            VoiceId=voice['Id'],
-            OutputFormat=tts_config.audio_format,
-            SampleRate=tts_config.sample_rate,
-        )
+        log.info(u'Synthesizing with voice:"%s": "%s"',
+            voice.name, msg)
 
-        tmp_f, tmp_fn = tempfile.mkstemp(
-            suffix='.' + tts_config.audio_format,
-            prefix='sopel-tts-',
-        )
-        os.close(tmp_f)
-        log.debug('Writing audio to: %s', tmp_fn)
-        with open(tmp_fn, 'w') as tmp_f:
-            try:
-                tmp_f.write(resp['AudioStream'].read())
-            except Exception as err:
-                log.error('Failed to write audio file (%s): %s', tmp_fn, err)
-                log.exception(err)
-            else:
-                audio_queue.put(tmp_fn)
-                log.debug('Queued audio file: %s', tmp_fn)
+        try:
+            speech = voice.speak(msg)
+        except Exception as err:
+            log.error('Failed to synthesize speech')
+            log.exception(err)
+            continue
+
+        tmp_fn = helper.write_to_tmp_file(speech)
+        if tmp_fn is not None:
+            audio_queue.put(tmp_fn)
+            log.debug('Queued audio file: %s', tmp_fn)
     log.debug('Worker process stopping')
 
 @multiprocessify
@@ -277,3 +266,108 @@ def clean_token(t):
     if t.startswith('*') and t.endswith('*') and len(t) >= 3:
         t = EMPHASIS_TEMPLATE.format('strong', t[1:-1])
     return t
+
+class AbstractVoice(object):
+    def __init__(self, client, data):
+        self._client = client
+        self._data = data
+
+    @property
+    def name(self): return self._get_name()
+
+    @property
+    def gender(self): return self._get_gender()
+
+    @property
+    def lang_id(self): return self._get_lang_code()
+
+    def speak(self, message, rate=1.0, format=None):
+        raise NotImplemented
+
+class GoogleVoice(AbstractVoice):
+    @property
+    def service(self):
+        return 'google-cloud'
+
+    def _get_name(self):
+        return self._data[u'name']
+
+    def _get_gender(self):
+        return self._data[u'ssmlGender'].upper()
+
+    def _get_lang_code(self):
+        return self._data[u'languageCodes'][0]
+
+    def speak(self, message):
+        return self._client.text().synthesize(body={
+            'audioConfig': {'audioEncoding': 'MP3', 'pitch': 0.0, 'speakingRate': 1.0},
+            'input': {'ssml': message},
+            'voice': {'name': self.name, 'languageCode': self.lang_id}}
+        ).execute()[u'audioContent'].decode('base64')
+
+class AmazonVoice(AbstractVoice):
+    @property
+    def service(self):
+        return 'aws'
+
+    def _get_name(self):
+        return self._data[u'Id']
+
+    def _get_gender(self):
+        return self._data[u'Gender'].upper()
+
+    def _get_lang_code(self):
+        return self._data[u'LanguageCode']
+
+    def speak(self, message):
+        return self._client.synthesize_speech(
+            Text=message,
+            TextType='ssml',
+            VoiceId=voice['Id'],
+            OutputFormat='mp3',
+            SampleRate=22050,
+        )['AudioStream'].read()
+
+class TTSHelper(object):
+    def __init__(self, logger, tts_config):
+        self.log = logger
+        self._config = tts_config
+        self._svc_glcoud = googleapiclient.discovery.build(
+            'texttospeech', 'v1beta1', developerKey=tts_config.gcloud_api_key)
+        self._svc_aws = boto3.client('polly',
+            aws_access_key_id=tts_config.aws_access_key,
+            aws_secret_access_key=tts_config.aws_secret_key,
+        )
+
+    def purge_tmp_files(self):
+        for old_fn in glob.glob(os.path.join(tempfile.gettempdir(), 'sopel-tts-*.*')):
+            self.log.info('Deleteing old temp file: %s', old_fn)
+            os.unlink(old_fn)
+
+    def get_all_voices(self):
+        return sorted(self._get_gcloud_voices() + self._get_aws_voices(), key=lambda v: v.name)
+
+    def write_to_tmp_file(self, data):
+        tmp_f, tmp_fn = tempfile.mkstemp(
+            suffix='.mp3',
+            prefix='sopel-tts-',
+        )
+        os.close(tmp_f)
+        self.log.debug('Writing audio to: %s', tmp_fn)
+        with open(tmp_fn, 'w') as tmp_f:
+            try:
+                tmp_f.write(data)
+            except Exception as err:
+                self.log.error('Failed to write audio file (%s): %s', tmp_fn, err)
+                self.log.exception(err)
+            else:
+                return tmp_fn
+        return None
+
+    def _get_gcloud_voices(self):
+        return [GoogleVoice(self._svc_glcoud, v) \
+            for v in self._svc_glcoud.voices().list().execute()['voices']]
+
+    def _get_aws_voices(self):
+        return [AmazonVoice(self._svc_aws, v) \
+            for v in self._svc_aws.describe_voices()['Voices']]
